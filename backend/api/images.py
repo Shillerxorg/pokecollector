@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, RedirectResponse
 import hashlib
 import httpx
@@ -50,7 +50,11 @@ def _card_back_response():
     # Keep using the frontend's existing placeholder artwork. The backend only
     # changes the missing-image response behavior; it must not replace the
     # placeholder image data/design.
-    return RedirectResponse(url="/cardback.jpg", status_code=307)
+    return RedirectResponse(
+        url="/cardback.jpg",
+        status_code=307,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 def _set_fallback_response():
@@ -60,8 +64,15 @@ def _set_fallback_response():
     return FileResponse(
         _SET_FALLBACK_IMAGE,
         media_type="image/svg+xml",
-        headers={"Cache-Control": "public, max-age=86400"},
+        headers={"Cache-Control": "public, max-age=2592000, immutable"},
     )
+
+
+def _matches_etag(if_none_match: str | None, etag: str) -> bool:
+    if not if_none_match:
+        return False
+    tokens = [token.strip() for token in if_none_match.split(",")]
+    return "*" in tokens or etag in tokens or f"W/{etag}" in tokens
 
 
 def _is_globally_visible_card_image(db: Session, card: Card) -> bool:
@@ -179,6 +190,7 @@ def _get_or_fetch_custom_image(
 def get_card_image(
     card_id: str,
     size: str,
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
     if size not in ("small", "large"):
@@ -198,9 +210,26 @@ def get_card_image(
     if not url:
         return _card_back_response()
 
+    url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()
+    etag = f'"{url_hash}"'
+    is_custom_artwork = bool(card.is_custom or (card.custom_image_url and url == card.custom_image_url))
+    cache_control = (
+        "public, max-age=3600, must-revalidate"
+        if is_custom_artwork
+        else "public, max-age=2592000, immutable"
+    )
+
+    if request is not None and _matches_etag(request.headers.get("if-none-match"), etag):
+        return Response(
+            status_code=304,
+            headers={
+                "ETag": etag,
+                "Cache-Control": cache_control,
+            },
+        )
+
     try:
         if card.is_custom:
-            url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()
             data, content_type = _get_or_fetch_custom_image(
                 db,
                 f"card:{card_id}:{size}:manual:{url_hash}",
@@ -210,19 +239,26 @@ def get_card_image(
         elif card.custom_image_url and url == card.custom_image_url:
             data, content_type = _get_or_fetch_custom_image(db, f"card:{card_id}:{size}:custom", url)
         else:
-            url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()
             data, content_type = _get_or_fetch(db, f"card:{card_id}:{size}:{url_hash}", url)
     except (HTTPException, ValueError):
         return _card_back_response()
     return Response(
         content=data,
         media_type=content_type,
-        headers={"Cache-Control": "public, max-age=86400"},
+        headers={
+            "ETag": etag,
+            "Cache-Control": cache_control,
+        },
     )
 
 
 @router.get("/set/{set_id}/{image_type}")
-def get_set_image(set_id: str, image_type: str, db: Session = Depends(get_db)):
+def get_set_image(
+    set_id: str,
+    image_type: str,
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
     if image_type not in ("logo", "symbol"):
         raise HTTPException(status_code=400, detail="image_type must be logo or symbol")
 
@@ -250,6 +286,18 @@ def get_set_image(set_id: str, image_type: str, db: Session = Depends(get_db)):
     if not url:
         return _set_fallback_response()
 
+    url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()
+    etag = f'"{url_hash}"'
+
+    if request is not None and _matches_etag(request.headers.get("if-none-match"), etag):
+        return Response(
+            status_code=304,
+            headers={
+                "ETag": etag,
+                "Cache-Control": "public, max-age=2592000, immutable",
+            },
+        )
+
     try:
         data, content_type = _get_or_fetch(db, cache_key, url)
     except HTTPException as exc:
@@ -259,7 +307,10 @@ def get_set_image(set_id: str, image_type: str, db: Session = Depends(get_db)):
     return Response(
         content=data,
         media_type=content_type,
-        headers={"Cache-Control": "public, max-age=86400"},
+        headers={
+            "ETag": etag,
+            "Cache-Control": "public, max-age=2592000, immutable",
+        },
     )
 
 
